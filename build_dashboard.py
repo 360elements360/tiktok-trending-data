@@ -52,27 +52,52 @@ def with_growth(items, old, key):
     return items
 
 
+def snapshot_at(before):
+    """Parse discover-us.json as of the last commit before `before`; ([],[],[],'') if none."""
+    sha = sh("git", "log", "-1", "--format=%H", f"--before={before}", "--", "discover-us.json")
+    if not sha:
+        return [], [], [], ""
+    date = sh("git", "log", "-1", "--format=%cd", "--date=format:%b %d", sha)
+    try:
+        c, h, s = parse_sections(json.loads(sh("git", "show", f"{sha}:discover-us.json")))
+    except json.JSONDecodeError:
+        return [], [], [], ""
+    return c, h, s, date
+
+
+def lifecycle(pct, prev):
+    """Classify from this week's growth (pct) and last week's (prev); None = not listed then."""
+    if pct is None:
+        return "Emerging"
+    if abs(pct) < 0.5 and (prev is None or abs(prev) < 0.5):
+        return "Steady"
+    if pct < 0:
+        return "Declining"
+    if prev is None or pct >= prev * 0.9:
+        return "Rising"
+    return "Peaking"
+
+
 def main():
     doc = json.load(open("discover-us.json", encoding="utf-8"))
     creators, hashtags, sounds = parse_sections(doc)
 
     data_date = sh("git", "log", "-1", "--format=%cd", "--date=format:%b %d %Y %H:%M",
                    "--", "discover-us.json")
-    old_sha = sh("git", "log", "-1", "--format=%H", "--before=7 days ago", "--", "discover-us.json")
-    old_date = ""
-    if old_sha:
-        old_raw = sh("git", "show", f"{old_sha}:discover-us.json")
-        old_date = sh("git", "log", "-1", "--format=%cd", "--date=format:%b %d", old_sha)
-        try:
-            oc, oh, os_ = parse_sections(json.loads(old_raw))
-        except json.JSONDecodeError:
-            oc, oh, os_ = [], [], []
-    else:
-        oc, oh, os_ = [], [], []
+    oc, oh, os_, old_date = snapshot_at("7 days ago")
+    _, oh2, os2, _ = snapshot_at("14 days ago")
 
     with_growth(hashtags, oh, "views")
     with_growth(sounds, os_, "posts")
     with_growth(creators, oc, "fans")
+
+    # last week's growth (7d vs 14d snapshot) -> lifecycle label per item
+    for items, old, older, key in ((hashtags, oh, oh2, "views"), (sounds, os_, os2, "posts")):
+        p7, p14 = growth_map(old, key), growth_map(older, key)
+        for i in items:
+            a, b = p7.get(i["name"]), p14.get(i["name"])
+            prev = (a - b) / b * 100 if a and b else None
+            i["stage"] = lifecycle(i["pct"], prev)
 
     # "Upcoming" = hashtags + sounds ranked by 7-day growth; brand-new entries first.
     rising = [dict(i, kind="tag", metric=i["views"]) for i in hashtags] + \
@@ -91,9 +116,18 @@ def esc(s):
     return html.escape(str(s))
 
 
+STAGE_ICON = {"Emerging": "✦", "Rising": "▲", "Peaking": "◆", "Steady": "•", "Declining": "▼"}
+
+
+def stage_html(stage):
+    if not stage:
+        return "<span></span>"
+    return f'<span class="chip {stage.lower()}">{STAGE_ICON[stage]} {stage}</span>'
+
+
 def delta_html(pct):
     if pct is None:
-        return '<span class="badge new">NEW</span>'
+        return '<span class="delta dash">&mdash;</span>'
     cls = "up" if pct >= 0 else "down"
     arrow = "▲" if pct >= 0 else "▼"
     p = f"{abs(pct):.0f}%" if abs(pct) >= 10 else f"{abs(pct):.1f}%"
@@ -111,7 +145,8 @@ def bar_rows(items, key, label_fn, sub_fn=None):
             f'title="{esc(label_fn(i))}: {i[key]:,}">'
             f'<span class="lbl">{esc(label_fn(i))}{sub}</span>'
             f'<span class="track"><span class="bar" style="width:{w:.1f}%"></span></span>'
-            f'<span class="val">{fmt(i[key])}</span>{delta_html(i.get("pct"))}</a>')
+            f'<span class="val">{fmt(i[key])}</span>{delta_html(i.get("pct"))}'
+            f'{stage_html(i.get("stage"))}</a>')
     return "\n".join(rows)
 
 
@@ -131,12 +166,14 @@ def render(rising, hashtags, sounds, creators, data_date, old_date):
             f'<a class="row" href="https://www.tiktok.com{esc(i["link"])}" target="_blank" '
             f'title="{esc(i["name"])}: {i["metric"]:,} now">'
             f'<span class="lbl"><span class="kind">{icon}</span>{esc(i["name"])}</span>'
-            f'{bar}<span class="val">{fmt(i["metric"])}</span>{delta_html(i["pct"])}</a>')
+            f'{bar}<span class="val">{fmt(i["metric"])}</span>{delta_html(i["pct"])}'
+            f'{stage_html(i.get("stage"))}</a>')
 
     tag_rows = "\n".join(
         f'<a class="trow" href="https://www.tiktok.com{esc(t["link"])}" target="_blank">'
         f'<span class="rank">{n}</span><span class="lbl">{esc(t["name"])}</span>'
-        f'<span class="val">{fmt(t["views"])}</span>{delta_html(t["pct"])}</a>'
+        f'<span class="val">{fmt(t["views"])}</span>{delta_html(t["pct"])}'
+        f'{stage_html(t.get("stage"))}</a>'
         for n, t in enumerate(sorted(hashtags, key=lambda x: -x["views"]), 1))
 
     sound_rows = bar_rows(sorted(sounds, key=lambda x: -x["posts"]), "posts",
@@ -175,8 +212,8 @@ def render(rising, hashtags, sounds, creators, data_date, old_date):
   .card .sub2 {{ color:var(--muted); font-size:12px; margin:0 0 12px }}
   .row,.trow {{ display:grid; align-items:center; gap:10px; padding:5px 6px;
     border-radius:6px; text-decoration:none; color:var(--ink) }}
-  .row {{ grid-template-columns:minmax(140px,1.1fr) 1fr 52px 62px }}
-  .trow {{ grid-template-columns:22px 1fr 60px 62px }}
+  .row {{ grid-template-columns:minmax(120px,1.1fr) 1fr 52px 58px 84px }}
+  .trow {{ grid-template-columns:22px 1fr 60px 58px 84px }}
   .row:hover,.trow:hover {{ background:var(--grid) }}
   .lbl {{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap }}
   .sub {{ color:var(--muted); font-size:12px; margin-left:6px }}
@@ -190,14 +227,25 @@ def render(rising, hashtags, sounds, creators, data_date, old_date):
   .val {{ font-variant-numeric:tabular-nums; text-align:right; color:var(--ink2) }}
   .delta {{ font-size:12px; font-variant-numeric:tabular-nums; text-align:right }}
   .delta.up {{ color:var(--up) }} .delta.down {{ color:var(--down) }}
-  .badge.new {{ font-size:11px; font-weight:600; color:var(--newc);
-    border:1px solid var(--newc); border-radius:4px; padding:0 4px; text-align:center }}
+  .delta.dash {{ color:var(--muted) }}
+  .chip {{ font-size:11px; font-weight:600; border-radius:4px; padding:1px 5px;
+    text-align:center; border:1px solid transparent }}
+  .chip.emerging {{ color:var(--newc); border-color:var(--newc) }}
+  .chip.rising {{ color:var(--series); border-color:var(--series) }}
+  .chip.peaking {{ color:#c98500; border-color:#c98500 }}
+  .chip.steady {{ color:var(--muted); border-color:var(--ring) }}
+  .chip.declining {{ color:var(--down); border-color:var(--down) }}
   footer {{ max-width:1200px; margin:16px auto 0; color:var(--muted); font-size:12px }}
 </style></head><body>
 <header>
   <h1>TikTok Trends &mdash; US Discover</h1>
   <div class="meta">Data snapshot: {esc(data_date)} UTC &middot; growth {esc(win)} &middot;
   click any row to open on TikTok</div>
+  <div class="meta">Lifecycle: <span class="chip emerging">✦ Emerging</span> new on the list &middot;
+  <span class="chip rising">▲ Rising</span> growth holding or accelerating &middot;
+  <span class="chip peaking">◆ Peaking</span> still growing but slowing &middot;
+  <span class="chip steady">• Steady</span> flat &middot;
+  <span class="chip declining">▼ Declining</span> shrinking</div>
 </header>
 <div class="grid">
   <div class="card"><h2>Upcoming &mdash; fastest growing (7 days)</h2>
